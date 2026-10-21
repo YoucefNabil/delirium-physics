@@ -79,6 +79,7 @@ NM_API int32_t nm_agent_set_incoming_transforms(NmAgent* a, const float* transfo
 NM_API int32_t nm_agent_set_zero_pose(NmAgent* a, const float* transforms, int32_t parts);
 NM_API int32_t nm_agent_get_part_drive(const NmAgent* a, int32_t i, float* force, float* torque);
 NM_API int32_t nm_agent_get_part_drives(const NmAgent* a, float* out, int32_t parts);
+NM_API int32_t nm_agent_get_joint_accels(const NmAgent* a, float* out, int32_t parts);
 NM_API int32_t nm_agent_get_part_contact(const NmAgent* a, int32_t i);
 NM_API int32_t nm_agent_get_com(const NmAgent* a, float* pos, float* vel);
 NM_API float nm_agent_get_mass(const NmAgent* a);

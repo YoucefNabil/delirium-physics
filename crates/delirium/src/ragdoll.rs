@@ -929,6 +929,9 @@ pub struct Ragdoll {
     pending: Vec<(usize, Vec3, Vec3, Vec3)>,
     pub out: Vec<(Vec3, Vec3)>,
     pub joint_torque: Vec<Vec3>,
+    /// each joint's relative angular acceleration (child minus parent, world) that its muscles and soft limits drive
+    /// through the whole body's articulated inertia, from the last step
+    pub joint_accel: Vec<Vec3>,
     pub armature: Vec<f32>,
     o: Vec3,
     pub bound_off: Vec3,
@@ -1005,7 +1008,7 @@ impl Ragdoll {
             order.extend((0..n).filter(|&c| build.parts[c].parent == Some(k)));
         }
         Ragdoll { nm: build.nm, pins: vec![None; n], cons: vec![(None, None); n], grips: vec![], snapped: vec![], gone: 0, grip_rows: vec![], touch: vec![0; n], contact_off: 0, hit: vec![None; n], contact: crate::bump::ContactRecord::new(), ob_hits: vec![], held: vec![vec![]; n], stage_vel: vec![], stage_lt: vec![], stage_lim: vec![], stiff: vec![], bodies, order, mode: 1, still: [SLEEP_STOP - 2, SLEEP_SLEEP - 2],
-                  sleep_tol: [SLEEP_V2, SLEEP_W2, SLEEP_MEAN2], asleep: false, age: 0.0, fresh: false, pending: vec![], pairs: vec![], seen: vec![], coll: vec![], held_pairs: vec![], held_car: vec![], prep_twist: vec![], rigid: None, inertia: None, inst: None, out: vec![(Vec3::ZERO, Vec3::ZERO); n], joint_torque: vec![Vec3::ZERO; n], armature: vec![0.0; n], o, bound_off: Vec3::ZERO,
+                  sleep_tol: [SLEEP_V2, SLEEP_W2, SLEEP_MEAN2], asleep: false, age: 0.0, fresh: false, pending: vec![], pairs: vec![], seen: vec![], coll: vec![], held_pairs: vec![], held_car: vec![], prep_twist: vec![], rigid: None, inertia: None, inst: None, out: vec![(Vec3::ZERO, Vec3::ZERO); n], joint_torque: vec![Vec3::ZERO; n], joint_accel: vec![Vec3::ZERO; n], armature: vec![0.0; n], o, bound_off: Vec3::ZERO,
                   rejuv: 0, mwc: (1, 0) }
     }
 
@@ -2042,6 +2045,7 @@ impl Ragdoll {
             self.out[k] = (f, drive.torque.get(k).filter(|_| self.gone >> k & 1 == 0).copied().unwrap_or(Vec3::ZERO) + jt[k]);
         }
         self.joint_torque = jt.clone();
+        self.joint_accel = (0..jt.len()).map(|k| if joints[k].is_some() && jt[k] != Vec3::ZERO { answer(&artic, k, jt[k].as_dvec3()).as_vec3() } else { Vec3::ZERO }).collect();
         for (k, j) in joints.iter().enumerate() {
             if let Some(j) = j {
                 self.out[j.parent].1 -= jt[k];

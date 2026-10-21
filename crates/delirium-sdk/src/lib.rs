@@ -640,6 +640,22 @@ pub unsafe extern "C" fn nm_agent_get_part_drives(a: *const NmAgent, out: *mut f
     n as i32
 }
 
+/// Every part's joint acceleration from its muscles (3 floats each, world, rad/s^2): how fast the muscles turn the
+/// part against its parent through the whole body. A FOLLOW host whose own bodies have other masses applies this as a
+/// change of the joint's relative spin (times its step) rather than the torques. The root's is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_get_joint_accels(a: *const NmAgent, out: *mut f32, parts: i32) -> i32 {
+    let a = agent_ref!(a);
+    if out.is_null() {
+        return fail(NM_E_ARG, "null out");
+    }
+    let n = (parts.max(0) as usize).min(a.agent.doll.joint_accel.len());
+    for (k, v) in a.agent.doll.joint_accel.iter().take(n).enumerate() {
+        unsafe { put3(out.add(k * 3), *v) };
+    }
+    n as i32
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_agent_get_part_contact(a: *const NmAgent, i: i32) -> i32 {
     let a = agent_ref!(a);
