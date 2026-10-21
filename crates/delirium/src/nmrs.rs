@@ -254,13 +254,23 @@ pub(crate) fn zero_places(build: &Build) -> Vec<Vec3> {
         return places;
     }
     let turn = zero_pose(build);
-    let mut moved = vec![Vec3::ZERO; places.len()];
+    // NM_PLACES_GROWN=1: the older estimate (asset places moved by each part's growth), for comparing
+    if std::env::var("NM_PLACES_GROWN").is_ok() {
+        let mut moved = vec![Vec3::ZERO; places.len()];
+        for (c, p) in build.parts.iter().enumerate() {
+            if let Some(q) = p.parent {
+                let grown = |s: f32| 1.0 - 1.0 / s;
+                moved[c] = moved[q] + turn[q] * p.anchor_parent * grown(build.parts[q].size) - turn[c] * p.anchor * grown(p.size);
+            }
+            places[c] += ours(moved[c].into());
+        }
+        return places;
+    }
+    // the zero pose laid out through the build's own joints (a remapped build's anchors aren't scaled copies)
     for (c, p) in build.parts.iter().enumerate() {
         if let Some(q) = p.parent {
-            let grown = |s: f32| 1.0 - 1.0 / s;
-            moved[c] = moved[q] + turn[q] * p.anchor_parent * grown(build.parts[q].size) - turn[c] * p.anchor * grown(p.size);
+            places[c] = places[q] + ours((turn[q] * p.anchor_parent - turn[c] * p.anchor).into());
         }
-        places[c] += ours(moved[c].into());
     }
     places
 }

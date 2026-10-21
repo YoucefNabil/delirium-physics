@@ -125,10 +125,19 @@ impl Build {
                                  limit, lower: w[29] == "1", reach: w[30] == "1", name: w[0].to_string(),
                                  bind: w.iter().position(|&t| t == "B").map_or(q(34), |k| q(k + 1)), boxed: (w.get(38) == Some(&"b")).then(|| v(39)),
                                  inertia: w.iter().position(|&t| t == "i").map_or(Vec3::ZERO, |k| v(k + 1)) });
+            if let Some(k) = w.iter().position(|&t| t == "S") {
+                // optional: a fitted or scaled build's size, heft and leg growth
+                let p = parts.last_mut().unwrap();
+                (p.size, p.heft, p.grown) = (f(k + 1), f(k + 2), f(k + 3));
+            }
             frames.push(Transform::from_translation(v(31)).with_rotation(q(34)));
         }
         let mut build = Build { parts, nm };
-        crate::nmrs::asset_layout(&mut build, &mut frames);
+        // a fitted or scaled build (S token) already has its joints where its sizes put them; the NM asset's layout
+        // is the original character's and would pull them back to its proportions
+        if build.parts.iter().all(|p| p.size == 1.0) {
+            crate::nmrs::asset_layout(&mut build, &mut frames);
+        }
         (build, frames)
     }
 
@@ -150,6 +159,7 @@ impl Build {
             format!("{} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{} i {}", p.name, p.parent.map_or(-1, |j| j as i32), p.mass, p.radius, p.half,
                     v(p.offset.translation), q(p.offset.rotation), q(p.rest), v(p.anchor_parent), v(p.anchor), limit,
                     p.lower as u8, p.reach as u8, v(f.translation), q(f.rotation), p.boxed.map_or(String::new(), |e| format!(" b {}", v(e))), v(p.inertia)) + &bone
+                    + &if (p.size, p.heft, p.grown) == (1.0, 1.0, 1.0) { String::new() } else { format!(" S {} {} {}", p.size, p.heft, p.grown) }
                     + &format!(" B {}\n", q(p.bind))
         }).collect::<String>() + &if self.nm == crate::nmrs::HOMER { String::new() } else { format!("nm {}\n", self.nm) }
     }
@@ -209,6 +219,41 @@ impl Build {
             }
         }
         (build, out)
+    }
+
+    /// The same body rebuilt on another skeleton (bind pose): each part's joint is moved to `joints` and the part turned
+    /// to `rot` (world). Parts keep their own frame conventions, so shapes, joint limits and muscles mean the same.
+    /// A part with one child is stretched to the skeleton's joint distance (radius stays); with its bit set in `align`
+    /// it's also turned on from `rot` until its joint -> child joint line runs along the skeleton's. Unaligned, its
+    /// child's joint still lands exactly on the skeleton's, just off the part's own axis. Parts with several children take `rot` as it is and get their
+    /// children's joints exactly where `joints` puts them. The root's joint is its own origin.
+    pub fn remap(&self, joints: &[Vec3], rot: &[Quat], align: u32) -> (Build, Vec<Transform>) {
+        let n = self.parts.len();
+        let kids = |k: usize| (0..n).filter(|&c| self.parts[c].parent == Some(k)).collect::<Vec<usize>>();
+        let mut b = self.clone();
+        let mut out = vec![Transform::IDENTITY; n];
+        for k in 0..n {
+            let own = if self.parts[k].parent.is_some() { self.parts[k].anchor } else { Vec3::ZERO };
+            let (mut r, mut s) = (rot[k].normalize(), 1.0f32);
+            if let [c] = kids(k)[..] {
+                let (ours, theirs) = (self.parts[c].anchor_parent - own, joints[c] - joints[k]);
+                if ours.length() > 1e-4 && theirs.length() > 1e-4 {
+                    if align & (1 << k) != 0 {
+                        r = (Quat::from_rotation_arc((r * ours).normalize(), theirs.normalize()) * r).normalize();
+                    }
+                    s = theirs.length() / ours.length();
+                }
+            }
+            let p = &mut b.parts[k];
+            (p.anchor, p.half, p.bind) = (p.anchor * s, p.half * s, r);
+            out[k] = Transform::from_translation(joints[k] - r * own * s).with_rotation(r);
+        }
+        for c in 0..n {
+            if let Some(q) = b.parts[c].parent {
+                b.parts[c].anchor_parent = out[q].rotation.inverse() * (joints[c] - out[q].translation);
+            }
+        }
+        (b, out)
     }
 
     pub fn scaled(&self, frames: &[Transform], len: &[f32], m: f32) -> (Build, Vec<Transform>) {

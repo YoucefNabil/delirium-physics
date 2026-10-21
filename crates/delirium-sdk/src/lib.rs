@@ -91,11 +91,16 @@ pub unsafe extern "C" fn nm_init_memory(xrt: *const u8, len: i32) -> i32 {
         return fail(NM_E_ARG, "nm_init_memory: no data");
     }
     let d = unsafe { std::slice::from_raw_parts(xrt, len as usize) };
-    let Ok(asset) = std::panic::catch_unwind(|| delirium_data::nm_asset::read(d)) else {
-        return fail(NM_E_PARSE, "nm_init: not an NM character file");
+    // Xbox 360 .xrt is big-endian, PC .art little-endian: try both, keep the one that parses to the full joint table
+    let joints = |le: bool| {
+        delirium_data::LE.store(le, std::sync::atomic::Ordering::Relaxed);
+        std::panic::catch_unwind(|| delirium_data::nm_asset::read(d).len()).unwrap_or(0)
     };
+    if joints(false) < 20 && joints(true) < 20 {
+        delirium_data::LE.store(false, std::sync::atomic::Ordering::Relaxed);
+        return fail(NM_E_PARSE, "nm_init: not an NM character file");
+    }
     let fresh = delirium::nmrs::ASSET[delirium::nmrs::HOMER].get().is_none();
-    drop(asset);
     delirium::nmrs::load(delirium::nmrs::HOMER, d);
     if fresh { 0 } else { 1 }
 }
@@ -262,6 +267,51 @@ pub unsafe extern "C" fn nm_build_load(path: *const c_char) -> *mut NmBuild {
     }
 }
 
+/// Part `i`'s joint with its parent (the root's: its centre), world, in the build's pose.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_part_joint(b: *const NmBuild, i: i32, pos: *mut f32) -> i32 {
+    let Some(b) = (unsafe { b.as_ref() }) else { return fail(NM_E_ARG, "null build") };
+    let (Some(p), Some(f)) = (b.build.parts.get(i as usize), b.frames.get(i as usize)) else { return fail(NM_E_ARG, "no such part") };
+    let at = if p.parent.is_some() { f.translation + f.rotation * p.anchor } else { f.translation };
+    unsafe { put3(pos, at) };
+    0
+}
+
+/// `build` kept in its own pose, each part's bone (to its children's joints) stretched by `len[i]` (21 floats), and
+/// girth and masses scaled so the whole body weighs `mass` times the original. Unlike nm_build_fit it doesn't take
+/// another skeleton's pose.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_scale(build: *const NmBuild, len: *const f32, mass: f32) -> *mut NmBuild {
+    let Some(b) = (unsafe { build.as_ref() }) else {
+        fail(NM_E_ARG, "nm_build_scale: null build");
+        return std::ptr::null_mut();
+    };
+    let n = b.build.parts.len();
+    if len.is_null() || !(mass.is_finite() && mass > 0.0) {
+        fail(NM_E_ARG, "nm_build_scale: no lengths, or mass <= 0");
+        return std::ptr::null_mut();
+    }
+    let l = unsafe { std::slice::from_raw_parts(len, n) };
+    if l.iter().any(|x| !(x.is_finite() && *x > 0.0)) {
+        fail(NM_E_ARG, "nm_build_scale: lengths must be > 0");
+        return std::ptr::null_mut();
+    }
+    let (build, frames) = b.build.scaled(&b.frames, l, mass);
+    Box::into_raw(Box::new(NmBuild { build, frames }))
+}
+
+/// Writes the build as a dump `nm_build_load` and the room read back. Mass overrides (size, heft) aren't in the
+/// format: a loaded copy weighs the character file's masses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_save(b: *const NmBuild, path: *const c_char) -> i32 {
+    let Some(b) = (unsafe { b.as_ref() }) else { return fail(NM_E_ARG, "null build") };
+    let Some(p) = (unsafe { text(path) }) else { return fail(NM_E_ARG, "nm_build_save: no path") };
+    match std::fs::write(p, b.build.dump(&b.frames)) {
+        Ok(()) => 0,
+        Err(e) => fail(NM_E_IO, format!("{p}: {e}")),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_build_destroy(b: *mut NmBuild) {
     if !b.is_null() {
@@ -291,6 +341,21 @@ pub unsafe extern "C" fn nm_build_part_info(b: *const NmBuild, i: i32, mass: *mu
     0
 }
 
+/// Sets part `i`'s mass to `kg` (inertia follows), keeping its shape: for a fitted build whose cubed length scale
+/// overweights some parts. Agents made from the build afterwards use it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_set_mass(b: *mut NmBuild, i: i32, kg: f32) -> i32 {
+    let Some(b) = (unsafe { b.as_mut() }) else { return fail(NM_E_ARG, "null build") };
+    if !(kg.is_finite() && kg > 0.0) {
+        return fail(NM_E_ARG, "nm_build_set_mass: mass must be > 0");
+    }
+    let nm = b.build.nm;
+    let Some(p) = b.build.parts.get_mut(i as usize) else { return fail(NM_E_ARG, "no such part") };
+    let now = delirium::nmrs::MASSES[nm].get().and_then(|m| m.get(i as usize)).copied().unwrap_or(p.mass) * p.size.powi(3) * p.heft;
+    p.heft *= kg / now.max(1e-4);
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_build_fit(build: *const NmBuild, joints: *const f32) -> *mut NmBuild {
     let Some(b) = (unsafe { build.as_ref() }) else {
@@ -310,6 +375,34 @@ pub unsafe extern "C" fn nm_build_fit(build: *const NmBuild, joints: *const f32)
         return std::ptr::null_mut();
     }
     let (build, frames) = b.build.fit(&b.frames, &j);
+    Box::into_raw(Box::new(NmBuild { build, frames }))
+}
+
+/// Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint
+/// goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is
+/// stretched to the skeleton's joint distance; with bit (1 << part) set in `align` it is also turned on until its
+/// joint -> child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_destroy) or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_remap(build: *const NmBuild, joints: *const f32, rots: *const f32, align: u32) -> *mut NmBuild {
+    let Some(b) = (unsafe { build.as_ref() }) else {
+        fail(NM_E_ARG, "nm_build_remap: null build");
+        return std::ptr::null_mut();
+    };
+    let n = b.build.parts.len();
+    if joints.is_null() || rots.is_null() || n != 21 {
+        fail(NM_E_ARG, "nm_build_remap: no joints or rotations, or not a 21-part build");
+        return std::ptr::null_mut();
+    }
+    let j: Vec<Vec3> = unsafe { std::slice::from_raw_parts(joints, n * 3) }.chunks(3).map(|c| Vec3::new(c[0], c[1], c[2])).collect();
+    let r: Vec<Quat> = unsafe { std::slice::from_raw_parts(rots, n * 4) }.chunks(4).map(|c| Quat::from_xyzw(c[0], c[1], c[2], c[3])).collect();
+    let bad = j.iter().any(|v| !v.is_finite())
+        || r.iter().any(|q| !q.is_finite() || q.length() < 0.5)
+        || (1..n).any(|c| b.build.parts[c].parent.is_some_and(|p| j[c].distance(j[p]) < 1e-3));
+    if bad {
+        fail(NM_E_ARG, "nm_build_remap: joints or rotations not finite, or a joint on its parent's");
+        return std::ptr::null_mut();
+    }
+    let (build, frames) = b.build.remap(&j, &r, align);
     Box::into_raw(Box::new(NmBuild { build, frames }))
 }
 
@@ -498,6 +591,24 @@ pub unsafe extern "C" fn nm_agent_set_incoming_transforms(a: *mut NmAgent, trans
         let s = transforms.add(k * 7);
         Transform { translation: v3(s), rotation: Quat::from_xyzw(*s.add(3), *s.add(4), *s.add(5), *s.add(6)), ..Default::default() }
     }).collect();
+    0
+}
+
+/// The pose the agent's muscles and balance hold (its "zero pose"), from every part's world transform (7 floats each:
+/// position, quaternion xyzw). By default it is the build's own pose; a host game sets its animation's pose here, once
+/// or every frame, so the body keeps that posture instead of the build's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_set_zero_pose(a: *mut NmAgent, transforms: *const f32, parts: i32) -> i32 {
+    let a = agent!(a);
+    let n = parts.max(0) as usize;
+    if transforms.is_null() || n != a.agent.doll.frames().count() {
+        return fail(NM_E_ARG, "need every part's transform");
+    }
+    let frames: Vec<Transform> = (0..n).map(|k| unsafe {
+        let s = transforms.add(k * 7);
+        Transform { translation: v3(s), rotation: Quat::from_xyzw(*s.add(3), *s.add(4), *s.add(5), *s.add(6)).normalize(), ..Default::default() }
+    }).collect();
+    a.agent.set_zero(&a.build, &frames);
     0
 }
 
