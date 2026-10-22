@@ -73,10 +73,23 @@ pub struct BuildPart {
     pub boxed: Option<[f32; 3]>,
     pub inertia: [f32; 3],
     pub frame: Frame,
+    // test bodies only (fit-test): the joint's limit with its own frames, used in place of the character's limits
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_limit: Option<JointLimit>,
 }
 
 fn q(v: [f32; 4]) -> Quat {
     Quat::from_array(v)
+}
+
+fn limit(l: &JointLimit) -> Limit {
+    match *l {
+        JointLimit::Cone { swing, twist } => Limit::Cone { swing, twist },
+        JointLimit::Hinge { axis, lo, hi, twist } => Limit::Hinge { axis: Vec3::from_array(axis), lo, hi, twist },
+        JointLimit::Bone { parent_frame, child_frame, lean, twist } => Limit::Bone { pf: q(parent_frame), cf: q(child_frame), lean, twist },
+        JointLimit::BoneHinge { parent_frame, child_frame, lo, hi } => Limit::BoneHinge { pf: q(parent_frame), cf: q(child_frame), lo, hi },
+        JointLimit::Locked => Limit::Locked,
+    }
 }
 
 fn fr(t: &Transform) -> Frame {
@@ -103,7 +116,7 @@ impl Character {
                 Limit::Locked => JointLimit::Locked,
             },
             lower: p.lower, reach: p.reach, bind: p.bind.to_array(), boxed: p.boxed.map(|e| e.to_array()),
-            inertia: p.inertia.to_array(), frame: fr(f),
+            inertia: p.inertia.to_array(), frame: fr(f), body_limit: None,
         }).collect());
         Character { format: FORMAT.into(), joints, parts, self_collision: nm_asset::self_collision(d).into_iter().map(|(a, b)| [a, b]).collect(), build }
     }
@@ -148,7 +161,7 @@ impl Character {
                 JointLimit::Locked => Limit::Locked,
             },
             lower: p.lower, reach: p.reach, name: p.name.clone(), bind: q(p.bind), boxed: p.boxed.map(Vec3::from_array),
-            inertia: Vec3::from_array(p.inertia), size: 1.0, heft: 1.0, grown: 1.0,
+            inertia: Vec3::from_array(p.inertia), size: 1.0, heft: 1.0, grown: 1.0, body_limit: p.body_limit.as_ref().map(limit),
         }).collect();
         let mut build = Build { parts, nm: delirium::nmrs::HOMER };
         delirium::nmrs::asset_layout(&mut build, &mut frames);

@@ -84,6 +84,9 @@ pub struct PartDef {
     pub size: f32,
     pub heft: f32,
     pub grown: f32,
+    // test bodies only: this joint's limit with its own frames (e.g. another game's ragdoll), used in place of the
+    // character's limits; the muscles keep the character's joint frame
+    pub body_limit: Option<Limit>,
 }
 
 impl PartDef {
@@ -120,7 +123,7 @@ impl Build {
                 None if w[22] == "c" => Limit::Cone { swing: f(23), twist: f(24) },
                 None => Limit::Hinge { axis: v(23), lo: f(26), hi: f(27), twist: f(28) },
             };
-            parts.push(PartDef { size: 1.0, heft: 1.0, grown: 1.0, bone: parts.len(), parent: w[1].parse::<i32>().ok().filter(|&j| j >= 0).map(|j| j as usize), mass: f(2), radius: f(3), half: f(4),
+            parts.push(PartDef { size: 1.0, heft: 1.0, grown: 1.0, body_limit: None, bone: parts.len(), parent: w[1].parse::<i32>().ok().filter(|&j| j >= 0).map(|j| j as usize), mass: f(2), radius: f(3), half: f(4),
                                  offset: Transform::from_translation(v(5)).with_rotation(q(8)), rest: q(12), anchor_parent: v(16), anchor: v(19),
                                  limit, lower: w[29] == "1", reach: w[30] == "1", name: w[0].to_string(),
                                  bind: w.iter().position(|&t| t == "B").map_or(q(34), |k| q(k + 1)), boxed: (w.get(38) == Some(&"b")).then(|| v(39)),
@@ -297,7 +300,7 @@ impl Build {
             let limit = parent.map_or(Limit::Locked, |q| Limit::from_bone(bone.flags, bone.rot_min, bone.rot_max,
                 frames[q].rotation.inverse() * bind[p.bone].rotation, f.rotation.inverse() * bind[p.bone].rotation));
             let (radius, half) = if p.kind == 3 { (p.extent.iter().copied().fold(f32::MAX, f32::min), 0.0) } else { (p.radius, p.half) };
-            PartDef { size: 1.0, heft: 1.0, grown: 1.0, bone: p.bone, parent, mass: p.mass, radius, half,
+            PartDef { size: 1.0, heft: 1.0, grown: 1.0, body_limit: None, bone: p.bone, parent, mass: p.mass, radius, half,
                       offset: Transform::from_matrix(bind[p.bone].to_matrix().inverse() * f.to_matrix()),
                       rest, anchor_parent, anchor: f.rotation.inverse() * (joint - f.translation), limit,
                       lower: i == pelvis || ["Thigh", "Calf", "Foot"].iter().any(|l| name.ends_with(l)),
@@ -498,6 +501,8 @@ struct Joint {
     stiff: f32,
     mode: u32,
     jc: crate::rigid::JointConst,
+    // the body's own limit (PartDef::body_limit): its frames and range, for the limit solver only
+    lim: Option<(crate::rigid::JointConst, Kind)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -543,7 +548,11 @@ impl Joint {
                 }
             }
         };
-        Joint { parent, pf, cf, kind, stiff, mode: if rigid.is_some() { 3 } else { 0 }, jc: Default::default() }
+        Joint { parent, pf, cf, kind, stiff, mode: if rigid.is_some() { 3 } else { 0 }, jc: Default::default(), lim: None }
+    }
+
+    fn limit(&self) -> (crate::rigid::JointConst, Kind) {
+        self.lim.unwrap_or((self.jc, self.kind))
     }
 }
 
@@ -1086,7 +1095,7 @@ impl Ragdoll {
     pub fn mobility(&self, build: &Build, rigid: &[Rigid], k: usize) -> [Vec3; 3] {
         let joints: Vec<Option<Joint>> = build.parts.iter().enumerate().map(|(i, p)| p.parent.map(|j| {
             let j = Joint::new(p, j, rigid.get(i));
-            Joint { jc: self.jconst(build, i, &j, rigid.get(i)), ..j }
+            Joint { jc: self.jconst(build, i, &j, rigid.get(i)), lim: self.body_limit(build, i), ..j }
         })).collect();
         let artic = self.artic(&joints);
         [DVec3::X, DVec3::Y, DVec3::Z].map(|e| artic::parts(artic.own(k, v6(DVec3::ZERO, e))).1.as_vec3())
@@ -1383,13 +1392,14 @@ impl Ragdoll {
         let b = &self.bodies;
         for (k, j) in joints.iter().enumerate() {
             let Some(j) = *j else { continue };
+            let (jc, kind) = j.limit();
             let (pl, cl) = (b[j.parent].link(), b[k].link());
             let speed = |a: Vec3| sdot(cl.w, a, b"yzx") - sdot(pl.w, a, b"yzx");
             let mut past: Vec<(Vec3, f32)> = vec![];
-            match j.kind {
+            match kind {
                 Kind::Hinge { lo, hi } => {
                     let (lo, hi) = hinge_limits(lo, hi);
-                    let (a, n) = (crate::rigid::hinge(&j.jc, &pl, &cl), crate::rigid::hinge_axis(&j.jc, &cl));
+                    let (a, n) = (crate::rigid::hinge(&jc, &pl, &cl), crate::rigid::hinge_axis(&jc, &cl));
                     let (oh, ol) = (a - hi, a - lo);
                     if !(oh > 0.0) && ol >= 0.0 {
                         continue;
@@ -1412,7 +1422,7 @@ impl Ragdoll {
                     continue;
                 }
                 Kind::Ball { lean, twist } => {
-                    let st = crate::rigid::swing3(&j.jc, &pl, &cl);
+                    let st = crate::rigid::swing3(&jc, &pl, &cl);
                     if let Some(lim) = lean_limit(&st, lean) {
                         let (over, ls) = (st.theta - lim, speed(st.s));
                         let f = (if ls >= 0.0 { 0.0 } else { ls }).fma(h, over);
@@ -1468,12 +1478,13 @@ impl Ragdoll {
         let n = 6 * b.len();
         for (k, j) in joints.iter().enumerate() {
             let Some(j) = *j else { continue };
+            let (jc, kind) = j.limit();
             let (pl, cl) = (b[j.parent].link(), b[k].link());
             let mut dofs: Vec<(Vec3, f32, f32)> = vec![];
-            match j.kind {
+            match kind {
                 Kind::Hinge { lo, hi } => {
                     let (lo, hi) = hinge_limits(lo, hi);
-                    let (a, n) = (crate::rigid::hinge(&j.jc, &pl, &cl), crate::rigid::hinge_axis(&j.jc, &cl));
+                    let (a, n) = (crate::rigid::hinge(&jc, &pl, &cl), crate::rigid::hinge_axis(&jc, &cl));
                     let side = if !(a - hi < 0.0) { 1 } else if a - lo <= 0.0 { -1 } else if touched[k] { if hi - a < a - lo { 1 } else { -1 } } else { 0 };
                     match side {
                         1 => dofs.push((n, a - hi, 1.0)),
@@ -1482,7 +1493,7 @@ impl Ragdoll {
                     }
                 }
                 Kind::Ball { lean, twist } => {
-                    let st = crate::rigid::swing3(&j.jc, &pl, &cl);
+                    let st = crate::rigid::swing3(&jc, &pl, &cl);
                     self.prep_twist[k] = Some(st.twist);
                     if let Some(lim) = lean_limit(&st, lean) {
                         dofs.push((st.s, st.theta - lim, 1.0));
@@ -1943,6 +1954,19 @@ impl Ragdoll {
         }
     }
 
+    fn body_limit(&self, build: &Build, k: usize) -> Option<(crate::rigid::JointConst, Kind)> {
+        let part = &build.parts[k];
+        let (pf, cf, kind) = match part.body_limit? {
+            Limit::Bone { pf, cf, lean, twist } => (pf, cf, Kind::Ball { lean, twist }),
+            Limit::BoneHinge { pf, cf, lo, hi } => (pf, cf, Kind::Hinge { lo, hi }),
+            Limit::Locked => (part.rest.inverse(), Quat::IDENTITY, Kind::Ball { lean: [0.0; 2], twist: 0.0 }),
+            _ => return None,
+        };
+        let (lp, lc) = (self.bodies[part.parent?].l.inverse(), self.bodies[k].l.inverse());
+        let rows = |q: Quat| { let m = Mat3::from_quat(q); [m.row(0), m.row(1), m.row(2)] };
+        Some((crate::rigid::JointConst { pm: rows(lp * pf), pa: lp * part.anchor_parent, ca: lc * part.anchor, cm: rows(lc * cf) }, kind))
+    }
+
     fn jconst(&self, build: &Build, k: usize, j: &Joint, rigid: Option<&Rigid>) -> crate::rigid::JointConst {
         rigid.and_then(|r| r.jc).unwrap_or_else(|| {
             let (lp, lc, part) = (self.bodies[j.parent].l.inverse(), self.bodies[k].l.inverse(), &build.parts[k]);
@@ -2023,7 +2047,7 @@ impl Ragdoll {
         self.hit.iter_mut().for_each(|h| *h = None);
         let joints: Vec<Option<Joint>> = build.parts.iter().enumerate().map(|(i, p)| p.parent.map(|j| {
             let j = Joint::new(p, j, drive.rigid.get(i));
-            Joint { jc: self.jconst(build, i, &j, drive.rigid.get(i)), ..j }
+            Joint { jc: self.jconst(build, i, &j, drive.rigid.get(i)), lim: self.body_limit(build, i), ..j }
         })).collect();
         let subs = 1;
         let h = dt / subs as f32;

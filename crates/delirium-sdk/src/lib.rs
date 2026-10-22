@@ -23,6 +23,9 @@ pub const NM_E_FOLLOW: i32 = -8;
 
 pub const NM_MODE_LEAD: i32 = 0;
 pub const NM_MODE_FOLLOW: i32 = 1;
+/// Test hosts: the ragdoll alone (no muscles, no behaviours), moved only by what the host sets on it; stands in for a
+/// game's own ragdoll when testing a FOLLOW agent offline.
+pub const NM_MODE_BODY: i32 = 2;
 
 thread_local! {
     static ERR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -478,7 +481,11 @@ pub unsafe extern "C" fn nm_agent_step(a: *mut NmAgent, w: *const NmWorld, dt: f
     if a.mode == NM_MODE_FOLLOW && !a.set.iter().all(|&s| s) {
         return fail(NM_E_FOLLOW, "FOLLOW: set every part's state (nm_agent_set_part_state[s]) before each step");
     }
-    if a.mode == NM_MODE_FOLLOW {
+    if a.mode == NM_MODE_BODY {
+        // a new agent's ragdoll starts "fresh" (no ground contacts) until its agent steps it once; nothing else clears it here
+        a.agent.doll.fresh = false;
+        a.agent.doll.step(&a.build, &w.0, dt, Default::default(), &w.1, &[]);
+    } else if a.mode == NM_MODE_FOLLOW {
         a.agent.step_follow(&a.build, &w.0, dt, &w.1, &[]);
     } else {
         a.agent.step(&a.build, &w.0, dt, &w.1, &[]);
@@ -490,8 +497,8 @@ pub unsafe extern "C" fn nm_agent_step(a: *mut NmAgent, w: *const NmWorld, dt: f
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_agent_set_mode(a: *mut NmAgent, mode: i32) -> i32 {
     let a = agent!(a);
-    if mode != NM_MODE_LEAD && mode != NM_MODE_FOLLOW {
-        return fail(NM_E_ARG, "mode is NM_MODE_LEAD or NM_MODE_FOLLOW");
+    if mode != NM_MODE_LEAD && mode != NM_MODE_FOLLOW && mode != NM_MODE_BODY {
+        return fail(NM_E_ARG, "mode is NM_MODE_LEAD, NM_MODE_FOLLOW or NM_MODE_BODY");
     }
     a.mode = mode;
     0
@@ -548,6 +555,29 @@ pub unsafe extern "C" fn nm_agent_get_part_velocity(a: *const NmAgent, i: i32, v
     unsafe {
         put3(vel, v);
         put3(angvel, w);
+    }
+    0
+}
+
+/// Part `i`'s world inverse inertia (9 floats, row-major) and inverse mass: what a host needs to turn the joint
+/// accelerations into its own bodies' spins the way the plugin does, when the host is a test body (NM_MODE_BODY).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_get_part_inv_inertia(a: *const NmAgent, i: i32, inv: *mut f32, inv_mass: *mut f32) -> i32 {
+    let a = agent_ref!(a);
+    let Some(k) = part(a, i) else { return fail(NM_E_ARG, "no such part") };
+    if inv.is_null() {
+        return fail(NM_E_ARG, "null out");
+    }
+    let m = a.agent.doll.tensor(k).inverse().as_mat3();
+    unsafe {
+        for r in 0..3 {
+            for c in 0..3 {
+                *inv.add(r * 3 + c) = m.row(r)[c];
+            }
+        }
+        if !inv_mass.is_null() {
+            *inv_mass = 1.0 / a.agent.doll.part_mass(k).max(1e-6);
+        }
     }
     0
 }
