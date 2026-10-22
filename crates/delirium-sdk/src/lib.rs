@@ -656,6 +656,21 @@ pub unsafe extern "C" fn nm_agent_get_joint_accels(a: *const NmAgent, out: *mut 
     n as i32
 }
 
+/// Every part's torque from behaviours acting on the part itself (3 floats each, world, N m): a shot's spin, electrocute's
+/// jolts. Not the muscles' (nm_agent_get_joint_accels): a FOLLOW host turns its own body by this on top of them.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_get_part_ext_torques(a: *const NmAgent, out: *mut f32, parts: i32) -> i32 {
+    let a = agent_ref!(a);
+    if out.is_null() {
+        return fail(NM_E_ARG, "null out");
+    }
+    let n = (parts.max(0) as usize).min(a.agent.doll.ext_torque.len());
+    for (k, v) in a.agent.doll.ext_torque.iter().take(n).enumerate() {
+        unsafe { put3(out.add(k * 3), *v) };
+    }
+    n as i32
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_agent_get_part_contact(a: *const NmAgent, i: i32) -> i32 {
     let a = agent_ref!(a);
