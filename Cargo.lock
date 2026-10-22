@@ -2017,6 +2017,7 @@ dependencies = [
  "bevy_egui",
  "delirium",
  "delirium-data",
+ "delirium-sdk",
  "mimalloc",
  "rapier3d",
 ]

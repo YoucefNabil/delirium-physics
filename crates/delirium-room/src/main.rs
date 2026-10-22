@@ -2555,6 +2555,21 @@ fn load(a: &[String], args: &[String], game_dir: Option<&str>, script: VecDeque<
     let arg = |i: usize, env: &str| pos.get(i - 1).cloned().or_else(|| std::env::var(env).ok());
     let from_game = |rpf: &str, p: &str| game_dir.and_then(|g| archive(g, rpf, &[p]).pop().flatten());
     let bpath = arg(2, "NM_BUILD");
+    // a character .json (the SDK's format) carries its zero pose and its body: no fred.xrt or build file needed
+    let own = arg(1, "XRT").filter(|x| x.ends_with(".json")).map(|x| {
+        let t = std::fs::read_to_string(&x).unwrap_or_else(|e| panic!("{x}: {e}"));
+        let c = delirium_physics::character::Character::parse(&t).unwrap_or_else(|e| panic!("{x}: {e}"));
+        let (j, p, m, s) = c.asset();
+        delirium::nmrs::set(nm(), j, p, m, s);
+        let (mut b, f) = c.build().unwrap_or_else(|| panic!("{x}: the file has no build"));
+        b.nm = nm();
+        eprintln!("character {x}: {} parts", b.parts.len());
+        (b, f)
+    });
+    let (build, frames, getup) = if let Some((b, f)) = own {
+        let getup = game_dir.and_then(|g| getup::Clips::load(g, &b).map_err(|e| eprintln!("get-up clips: {e}")).ok());
+        (b, f, getup)
+    } else {
     if game_dir.is_none() && bpath.is_none() && arg(1, "XRT").is_none() {
         pick_game(args);
     }
@@ -2565,7 +2580,7 @@ fn load(a: &[String], args: &[String], game_dir: Option<&str>, script: VecDeque<
         std::process::exit(2);
     };
     delirium::nmrs::load(nm(), &d);
-    let (build, frames, getup) = match (&bpath, game_dir) {
+    match (&bpath, game_dir) {
         (Some(p), _) => {
             let (b, f) = Build::undump(&std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p}: {e}")));
             let getup = game_dir.and_then(|g| getup::Clips::load(g, &b).map_err(|e| eprintln!("get-up clips: {e}")).ok());
@@ -2578,6 +2593,7 @@ fn load(a: &[String], args: &[String], game_dir: Option<&str>, script: VecDeque<
             (b, f, Some(clips))
         }).clone()),
         (None, None) => unreachable!(),
+    }
     };
     if let Ok(p) = std::env::var("NM_DUMP") {
         let _ = std::fs::write(p, build.dump(&frames));

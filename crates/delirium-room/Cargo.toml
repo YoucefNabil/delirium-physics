@@ -9,6 +9,8 @@ publish.workspace = true
 mimalloc = { version = "0.1", default-features = false }
 delirium = { path = "../delirium", features = ["bevy"] }
 delirium-data = { path = "../delirium-data" }
+# own character files (.json), the SDK's format
+delirium-sdk = { path = "../delirium-sdk" }
 # Only the engine parts the room uses (no animation, sprites, UI, picking or text): a smaller, quicker build.
 bevy = { version = "=0.18.1", default-features = false, features = [
     "default_app", "std", "bevy_sprite", "bevy_sprite_render", "multi_threaded", "bevy_winit", "x11", "wayland", "bevy_gilrs",
