@@ -130,6 +130,17 @@ pub unsafe extern "C" fn nm_load_task_params(path: *const c_char) -> i32 {
     }
 }
 
+/// Sets one task parameter (task, set or "*", name) on top of any loaded file, e.g. ("NMShot_Standing", "*", "shotMaxSteps", 10).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_set_task_param(task: *const c_char, set: *const c_char, name: *const c_char, value: f32) -> i32 {
+    let (Some(t), Some(s), Some(n)) = (unsafe { text(task) }, unsafe { text(set) }, unsafe { text(name) }) else {
+        return fail(NM_E_ARG, "nm_set_task_param: no task, set or name");
+    };
+    let mut g = TP.write().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(TaskParams::default).0.entry(t.to_string()).or_default().entry(s.to_string()).or_default().insert(n.to_string(), vec![value]);
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_part_name(i: i32, buf: *mut c_char, len: i32) -> i32 {
     match delirium_data::nm_asset::PARTS.get(i as usize) {
@@ -1000,6 +1011,12 @@ pub unsafe extern "C" fn nm_agent_get_param_string(a: *const NmAgent, message: *
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_agent_is_balancing(a: *const NmAgent) -> i32 {
     agent_ref!(a).agent.balancing() as i32
+}
+
+/// The balancer's stepping foot: 0 none, 1 left, 2 right; -1 when not balancing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_balance_stepping(a: *const NmAgent) -> i32 {
+    agent_ref!(a).agent.balance_steps().map_or(-1, |(_, s)| s as i32)
 }
 
 #[unsafe(no_mangle)]

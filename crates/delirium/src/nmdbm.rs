@@ -90,6 +90,48 @@ pub fn logged_links() -> Option<&'static [Quat]> {
 
 pub static DERIVED_LINKS: [std::sync::OnceLock<Vec<Quat>>; 2] = [const { std::sync::OnceLock::new() }; 2];
 
+/// Test-only balancer knobs from the environment (read once): NM_LEAD (s, COM prediction for foot placement),
+/// NM_ABORT and NM_CLAMP (factors on the give-up tilt and the step length clamp). Unset = unchanged.
+#[derive(Clone, Copy)]
+struct Knobs {
+    lead: Option<f32>,
+    abort: f32,
+    clamp: f32,
+    unlimited: bool,
+    // capture point experiments (unset = off): NM_CP_PLACE=k steps toward k x the capture point once she moves faster
+    // than NM_CP_V0 (m/s, default 0.6); NM_CP_TRIG=k decides to step from k x the capture point; NM_UPRIGHT=k keeps
+    // the pelvis upright against tipping (k x its tilt the other way)
+    cp_place: Option<f32>,
+    cp_v0: f32,
+    cp_trig: Option<f32>,
+    upright: Option<f32>,
+    trace: bool,
+    why: bool,
+    // NM_HOLD_STANCE: NM_UPRIGHT only while both feet are planted; NM_LEAN=rad: then lean that much into the fall
+    // NM_FAST=k: when urgent the swing foot lifts less and moves faster (k 0-1); NM_FAST_LAND=x: lands from x left
+    hold_stance: bool,
+    lean: Option<f32>,
+    fast: Option<f32>,
+    fast_land: Option<f32>,
+}
+/// 0-1: how urgent (her speed past NM_CP_V0, full at twice it)
+fn urgency(hvel: Vec3) -> f32 {
+    let v0 = knobs().cp_v0;
+    ((slen(hvel, b"zyx") - v0) / v0.max(0.1)).clamp(0.0, 1.0)
+}
+
+fn knobs() -> Knobs {
+    static K: std::sync::OnceLock<Knobs> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let f = |n: &str| std::env::var(n).ok().and_then(|s| s.parse::<f32>().ok());
+        Knobs { lead: f("NM_LEAD"), abort: f("NM_ABORT").unwrap_or(1.0), clamp: f("NM_CLAMP").unwrap_or(1.0),
+                unlimited: std::env::var("NM_UNLIMITED").is_ok(), cp_place: f("NM_CP_PLACE"), cp_v0: f("NM_CP_V0").unwrap_or(0.6),
+                cp_trig: f("NM_CP_TRIG"), upright: f("NM_UPRIGHT"),
+                trace: std::env::var("NM_TRACE").is_ok(), why: std::env::var("NM_WHY").is_ok(),
+                hold_stance: std::env::var("NM_HOLD_STANCE").is_ok(), lean: f("NM_LEAN"), fast: f("NM_FAST"), fast_land: f("NM_FAST_LAND") }
+    })
+}
+
 fn step_clamp(b: &Body, c: Config) -> f32 {
     if b.ch.mode == 2 { c.step_clamp * 0.7 } else { c.step_clamp }
 }
@@ -375,10 +417,10 @@ fn decide(s: &Snap, f: &mut Feet) {
     let mut left = if rc { a || !lc } else { !lc && b };
     let mut right = if lc { b || !rc } else { !rc && a };
     if left || right {
-        if f.countdown >= 0 {
+        if f.countdown >= 0 && !knobs().unlimited {
             f.countdown -= 1;
         }
-        if f.countdown <= 0 {
+        if f.countdown <= 0 && !knobs().unlimited {
             (left, right) = (false, false);
         }
     }
@@ -406,8 +448,23 @@ pub fn foot_placement(p: &Params, s: &Snap, f: &mut Feet) {
     }
     f.centre = (f.pos[0] + f.pos[1]) * 0.5;
     f.dist = [0.0; 2];
-    let pc = sat(s.hvel.mul_add(Vec3::splat(p.lead), s.com), up, sdot(f.centre, up, b"zyx"), b"yxz");
-    let inside = support(pc, &s.legs[0].foot, &s.legs[1].foot, 0.05, 0.15, up) > p.p172;
+    let k = knobs();
+    // the capture point's time: sqrt(h / g), h the com over the feet
+    let tc = (sdot(s.com - f.centre, up, b"zyx").max(0.3) / crate::ragdoll::GRAVITY).sqrt();
+    let speed = slen(s.hvel, b"zyx");
+    let lead = match k.cp_place {
+        Some(kp) => {
+            let u = ((speed - k.cp_v0) / k.cp_v0.max(0.1)).clamp(0.0, 1.0);
+            p.lead + (kp * tc - p.lead).max(0.0) * u
+        }
+        None => p.lead,
+    };
+    let pc = sat(s.hvel.mul_add(Vec3::splat(lead), s.com), up, sdot(f.centre, up, b"zyx"), b"yxz");
+    let pt = match k.cp_trig {
+        Some(kt) => sat(s.hvel.mul_add(Vec3::splat(kt * tc), s.com), up, sdot(f.centre, up, b"zyx"), b"yxz"),
+        None => pc,
+    };
+    let inside = support(pt, &s.legs[0].foot, &s.legs[1].foot, 0.05, 0.15, up) > p.p172;
     f.flags = (f.flags & !4) | (inside as u8) << 2;
     let (lpos, rpos) = (s.legs[0].foot.m.d, s.legs[1].foot.m.d);
     if f.flags & 4 != 0 && slen(shz(rpos - lpos, up, b"yzx"), b"zyx") > p.foot_width + 0.2 {
@@ -477,7 +534,8 @@ pub fn foot_placement(p: &Params, s: &Snap, f: &mut Feet) {
     f.centre = up.mul_add(Vec3::splat(sdot(mid, up, b"yzx") - sdot(f.centre, up, b"yzx")), f.centre);
     f.flags = (f.flags & 0x3F) | if two { 0x80 } else { 0x40 };
     let other = if two { s.flags & 0x80 != 0 } else { s.flags & 0x20 != 0 };
-    let landed = contact && speed < 0.0 && (left_frac < 0.5 || (f.flags & 8 != 0 && f.flags & 16 != 0));
+    let land_at = knobs().fast_land.map_or(0.5, |x| 0.5 + (x - 0.5) * urgency(s.hvel));
+    let landed = contact && speed < 0.0 && (left_frac < land_at || (f.flags & 8 != 0 && f.flags & 16 != 0));
     if landed || (contact && !other) {
         f.flags |= if two { 0x40 } else { 0x80 };
         f.stepping = 0;
@@ -548,6 +606,20 @@ pub fn pelvis_control(p: &Params, s: &Snap, pv: &mut Pelvis) {
     } else {
         pv.out[1] = 0.0;
         pv.acc -= (-0.2 * c).clamp(0.0, 0.5);
+    }
+    if let Some(l) = knobs().lean.filter(|_| both) {
+        let fwd = vnorm(up.vx(vnorm(m.c.vx(up))));
+        let sp = slen(s.hvel, b"zyx");
+        if sp > 1e-3 {
+            pv.acc = (pv.acc - l * urgency(s.hvel) * sdot(s.hvel, fwd, b"zyx") / sp).clamp(-0.6, 0.6);
+        }
+    }
+    if let Some(k) = knobs().upright.filter(|_| both || !knobs().hold_stance) {
+        // pitch the desired pelvis against its own tilt along its facing (acc > 0 pitches it back)
+        let fwd = vnorm(up.vx(vnorm(m.c.vx(up))));
+        let back = asin(-sdot(horizontal(m.a, up), fwd, b"zyx"));
+        let u = urgency(s.hvel);
+        pv.acc = (pv.acc - u * k * back).clamp(-0.6, 0.6);
     }
     let g = -sdot(p.normal[1], s.legs[1].foot.m.c, b"yzx") + -sdot(p.normal[0], s.legs[0].foot.m.c, b"yzx");
     if g > 0.05 {
@@ -769,6 +841,10 @@ pub fn balance_solve(p: &Params, f: &Feet, pv: &Pelvis, s: &mut Snap) {
         if !planted {
             let ahead = target[i] - (lfoot_v - p.gvel[0]).mul_add(Vec3::splat(0.05), leg.foot.m.d);
             (c.lead, c.reach, c.lift) = (p.p168, 5.0, sdot(up, ahead, b"yxz").fma(4.0, 0.1).clamp(0.15, 0.6));
+            if let Some(k) = knobs().fast {
+                let u = k * urgency(s.hvel);
+                (c.reach, c.lift) = (c.reach * (1.0 + u), (c.lift * (1.0 - 0.7 * u)).max(0.05));
+            }
         }
         let limb = leg.limb;
         leg_ik(&mut c, &limb, &mut leg.knee, &mut leg.hip, &leg.foot, &pelvis, vel);
@@ -1190,6 +1266,9 @@ impl Dbm {
             .min(horizontal(s.com - (l + r) * 0.5, up).length());
         (self.event, self.success) = (None, false);
         if off > self.p.abort * h || (h < 0.5 && self.p.low_abort) || self.f.countdown == -1 {
+            if knobs().why {
+                eprintln!("WHY off {off:.3} abort*h {:.3} h {h:.3} low {} countdown {}", self.p.abort * h, self.p.low_abort, self.f.countdown);
+            }
             return false;
         }
         self.success = slen(s.vel, b"yxz") < 0.25 && slen(s.angvel, b"yxz") < 0.25;
@@ -1218,9 +1297,13 @@ impl Dbm {
     }
 
     pub fn tick(&mut self, b: &Body, world: &Collision, c: Config, dt: f32) -> Option<Snap> {
+        let k = knobs();
         self.p.dt = dt;
-        self.p.step_clamp = step_clamp(b, c);
-        self.p.abort = c.abort;
+        self.p.step_clamp = step_clamp(b, c) * k.clamp;
+        self.p.abort = c.abort * k.abort;
+        if let Some(l) = k.lead {
+            self.p.lead = l;
+        }
         self.p.step_height = c.step_height;
         self.tilt(b);
         let mut s = b.snap(self.p.up);
@@ -1242,6 +1325,22 @@ impl Dbm {
             writeln!(f, "{:?}|{:?}|{:?}|{:?}", self.p, s, self.f, self.pv).unwrap();
         }
         foot_placement(&self.p, &s, &mut self.f);
+        if k.trace {
+            // per tick: com height over the feet, com ahead of the feet centre (along its velocity), com speed, trunk
+            // and pelvis tilt from up (deg), stepping foot, that foot's distance to its target, its speed
+            let up = self.p.up;
+            let (l, r) = (b.foot(0), b.foot(1));
+            let mid = (l + r) * 0.5;
+            let h = up.vd(s.com) - up.vd(l).min(up.vd(r));
+            let v = horizontal(s.vel, up);
+            let dir = vnorm(v);
+            let ahead = horizontal(s.com - mid, up).vd(dir);
+            let tilt = |m: &M34| acos(up.vd(vnorm(m.b))).to_degrees();
+            let i = self.f.stepping as usize;
+            let (gap, fv) = if i > 0 { let leg = &s.legs[i - 1]; (horizontal(self.f.pos[i - 1] - leg.foot.m.d, up).length(), horizontal(leg.foot.v, up).length()) } else { (0.0, 0.0) };
+            eprintln!("TR h {h:.2} ahead {ahead:.2} v {:.2} trunk {:.0} pelvis {:.0} step {} gap {gap:.2} fv {fv:.2} cd {}",
+                      v.length(), tilt(&s.spine.m), tilt(&s.pelvis.m), self.f.stepping, self.f.countdown);
+        }
         pelvis_control(&self.p, &s, &mut self.pv);
         balance_solve(&self.p, &self.f, &self.pv, &mut s);
         self.phase3(&mut s);

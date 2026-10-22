@@ -37,6 +37,7 @@ NM_API int32_t nm_last_error(char* buf, int32_t len);
 NM_API int32_t nm_init_memory(const uint8_t* xrt, int32_t len);
 NM_API int32_t nm_init(const char* xrt_path);
 NM_API int32_t nm_load_task_params(const char* path);
+NM_API int32_t nm_set_task_param(const char* task, const char* set, const char* name, float value);
 NM_API int32_t nm_part_name(int32_t i, char* buf, int32_t len);
 NM_API NmWorld* nm_world_create(void);
 NM_API void nm_world_destroy(NmWorld* w);
