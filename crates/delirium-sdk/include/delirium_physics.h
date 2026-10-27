@@ -64,6 +64,8 @@ NM_API NmBuild* nm_build_fit(const NmBuild* build, const float* joints);
 /* Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is stretched to the skeleton's joint distance; with bit (1 << part) set in `align` it is also turned on until its joint -> child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_free) or null. */
 NM_API NmBuild* nm_build_remap(const NmBuild* build, const float* joints, const float* rots, uint32_t align);
 NM_API int32_t nm_build_part_frame(const NmBuild* b, int32_t i, float* pos, float* rot);
+/* Moves part `i`'s joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are centred on a stance the body was not built for (a hunched creature on a person's body). Its rest moves with them. Agents made from the build afterwards use it. Fails for the root. */
+NM_API int32_t nm_build_turn_limit(NmBuild* b, int32_t i, const float* rot);
 NM_API NmAgent* nm_agent_create(const NmBuild* b, const float* pos, float yaw, float seed);
 NM_API void nm_agent_destroy(NmAgent* a);
 NM_API int32_t nm_agent_step(NmAgent* a, const NmWorld* w, float dt);

@@ -420,6 +420,24 @@ pub unsafe extern "C" fn nm_build_remap(build: *const NmBuild, joints: *const f3
     Box::into_raw(Box::new(NmBuild { build, frames }))
 }
 
+/// Moves part i's joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are
+/// centred on a stance the body wasn't built for (Build::turn_limit). Agents made from the build afterwards use it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_build_turn_limit(b: *mut NmBuild, i: i32, rot: *const f32) -> i32 {
+    let Some(b) = (unsafe { b.as_mut() }) else { return fail(NM_E_ARG, "null build") };
+    if rot.is_null() {
+        return fail(NM_E_ARG, "nm_build_turn_limit: no rotation");
+    }
+    let q = unsafe { Quat::from_xyzw(*rot, *rot.add(1), *rot.add(2), *rot.add(3)) };
+    if !q.is_finite() || q.length() < 1e-6 {
+        return fail(NM_E_ARG, "nm_build_turn_limit: not a rotation");
+    }
+    if i < 0 || !b.build.turn_limit(i as usize, q) {
+        return fail(NM_E_ARG, "nm_build_turn_limit: no such part, or the root (no joint)");
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nm_build_part_frame(b: *const NmBuild, i: i32, pos: *mut f32, rot: *mut f32) -> i32 {
     let Some(f) = (unsafe { b.as_ref() }).and_then(|b| b.frames.get(i as usize)) else { return fail(NM_E_ARG, "no such part") };

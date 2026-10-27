@@ -61,6 +61,8 @@ impl Limit {
 pub struct Build {
     pub parts: Vec<PartDef>,
     pub nm: usize,
+    /// made by remap: its joints sit on another skeleton, so its zero places are laid out through them, not the asset's
+    pub fitted: bool,
 }
 
 #[derive(Clone)]
@@ -135,7 +137,7 @@ impl Build {
             }
             frames.push(Transform::from_translation(v(31)).with_rotation(q(34)));
         }
-        let mut build = Build { parts, nm };
+        let mut build = Build { parts, nm, fitted: false };
         // a fitted or scaled build (S token) already has its joints where its sizes put them; the NM asset's layout
         // is the original character's and would pull them back to its proportions
         if build.parts.iter().all(|p| p.size == 1.0) {
@@ -234,6 +236,7 @@ impl Build {
         let n = self.parts.len();
         let kids = |k: usize| (0..n).filter(|&c| self.parts[c].parent == Some(k)).collect::<Vec<usize>>();
         let mut b = self.clone();
+        b.fitted = true;
         let mut out = vec![Transform::IDENTITY; n];
         for k in 0..n {
             let own = if self.parts[k].parent.is_some() { self.parts[k].anchor } else { Vec3::ZERO };
@@ -257,6 +260,23 @@ impl Build {
             }
         }
         (b, out)
+    }
+
+    /// Moves part `k`'s joint limits on by `d`, a turn of the child in its parent's frame: the stance its limits are
+    /// centred on becomes `d * (the child's rest turn in its parent)`. For a body standing other than it was built
+    /// (a hunched creature on a person's body), so its own stance isn't at or past its limits. Its rest moves with them
+    /// (the limits built from it). False for the root, which has no joint.
+    pub fn turn_limit(&mut self, k: usize, d: Quat) -> bool {
+        let Some(p) = self.parts.get_mut(k).filter(|p| p.parent.is_some()) else { return false };
+        let d = d.normalize();
+        // the limit compares pf^-1 * (child in parent) * cf: the same value at d * rel as before at rel
+        match &mut p.limit {
+            Limit::Bone { pf, .. } | Limit::BoneHinge { pf, .. } => *pf = (d * *pf).normalize(),
+            Limit::Cone { .. } | Limit::Hinge { .. } | Limit::Locked => {}
+        }
+        // rest is the parent in the child (rel^-1); Cone, Hinge and Locked limits are built from it
+        p.rest = (p.rest * d.inverse()).normalize();
+        true
     }
 
     pub fn scaled(&self, frames: &[Transform], len: &[f32], m: f32) -> (Build, Vec<Transform>) {
@@ -307,7 +327,7 @@ impl Build {
                       reach: name.ends_with("UpperArm") || name.ends_with("Forearm"), name: name.to_string(), bind: f.rotation,
                       boxed: (p.kind == 3).then(|| Vec3::from(p.extent)), inertia: Vec3::from(p.inertia) }
         }).collect();
-        Build { parts: defs, nm }
+        Build { parts: defs, nm, fitted: false }
     }
 }
 
@@ -1169,7 +1189,7 @@ impl Ragdoll {
         let under = |mut at: Option<usize>| { while let Some(a) = at { if a == k { return true; } at = build.parts[a].parent; } false };
         let below: Vec<usize> = self.order.iter().copied().filter(|&c| under(Some(c))).collect();
         let parts = below.iter().map(|&c| PartDef { parent: build.parts[c].parent.and_then(|q| below.iter().position(|&b| b == q)), ..build.parts[c].clone() }).collect();
-        let sub = Build { parts, nm: build.nm };
+        let sub = Build { parts, nm: build.nm, fitted: build.fitted };
         let frames: Vec<Transform> = self.frames().collect();
         let mut doll = Ragdoll::new(&sub, &below.iter().map(|&c| frames[c]).collect::<Vec<_>>(), Vec3::ZERO);
         for (i, &c) in below.iter().enumerate() {

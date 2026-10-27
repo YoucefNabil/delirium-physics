@@ -250,7 +250,7 @@ pub(crate) fn zero_pose(build: &Build) -> Vec<Quat> {
 pub(crate) fn zero_places(build: &Build) -> Vec<Vec3> {
     let Some(parts) = PARTS[build.nm].get() else { return vec![] };
     let mut places: Vec<Vec3> = parts.iter().map(|m| Vec3::from(m[3])).collect();
-    if places.len() != build.parts.len() || build.parts.iter().all(|p| p.size == 1.0) {
+    if places.len() != build.parts.len() || (!build.fitted && build.parts.iter().all(|p| p.size == 1.0)) {
         return places;
     }
     let turn = zero_pose(build);
