@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod character;
+pub mod helper;
 
 use delirium_data::taskparams::TaskParams;
 use delirium::collision::Collision;
@@ -454,6 +455,32 @@ pub struct NmAgent {
     mode: i32,
     set: Vec<bool>,
     pending: Option<(String, Vec<(String, Value)>)>,
+    helper: Option<(std::sync::Arc<helper::Net>, helper::State)>,
+    /// this agent's own random numbers for hit tasks (None: the shared ones; set by nm_agent_seed_tasks)
+    rand: Option<delirium_data::rng::Rand>,
+    /// what else is in the world besides the static mesh and the boxes: capsules it is pushed by (nm_agent_set_others)
+    others: Vec<delirium::ragdoll::Capsule>,
+    /// stable for its life: keys its held contacts with other agents in a group (nm_group_step)
+    id: usize,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// the random numbers a hit task draws from: the agent's own if seeded, else the shared ones
+fn with_rand<R>(a: &mut Option<delirium_data::rng::Rand>, f: impl FnOnce(&mut delirium_data::rng::Rand) -> R) -> R {
+    match a {
+        Some(r) => f(r),
+        None => f(&mut RAND.lock().unwrap_or_else(|e| e.into_inner())),
+    }
+}
+
+/// Gives the agent its own random numbers for hit tasks (shots, flinches), so its reactions repeat whatever other
+/// agents do on other threads. seed 0 goes back to the shared ones.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_seed_tasks(a: *mut NmAgent, seed: u32) -> i32 {
+    let Some(a) = (unsafe { a.as_mut() }) else { return fail(NM_E_ARG, "null agent") };
+    a.rand = (seed != 0).then_some(delirium_data::rng::Rand { seed });
+    0
 }
 
 fn placed(b: &NmBuild, pos: Vec3, yaw: f32) -> Vec<Transform> {
@@ -473,7 +500,8 @@ pub unsafe extern "C" fn nm_agent_create(b: *const NmBuild, pos: *const f32, yaw
     let frames = placed(b, pos, yaw);
     let agent = Agent::new(&b.build, Ragdoll::new(&b.build, &frames, Vec3::ZERO), Quat::from_rotation_z(yaw), seed);
     let n = frames.len();
-    Box::into_raw(Box::new(NmAgent { agent, build: b.build.clone(), mode: NM_MODE_LEAD, set: vec![false; n], pending: None }))
+    Box::into_raw(Box::new(NmAgent { agent, build: b.build.clone(), mode: NM_MODE_LEAD, set: vec![false; n], pending: None, helper: None, rand: None,
+        others: vec![], id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }))
 }
 
 #[unsafe(no_mangle)]
@@ -513,13 +541,106 @@ pub unsafe extern "C" fn nm_agent_step(a: *mut NmAgent, w: *const NmWorld, dt: f
     if a.mode == NM_MODE_BODY {
         // a new agent's ragdoll starts "fresh" (no ground contacts) until its agent steps it once; nothing else clears it here
         a.agent.doll.fresh = false;
-        a.agent.doll.step(&a.build, &w.0, dt, Default::default(), &w.1, &[]);
+        a.agent.doll.step(&a.build, &w.0, dt, Default::default(), &w.1, &a.others);
     } else if a.mode == NM_MODE_FOLLOW {
-        a.agent.step_follow(&a.build, &w.0, dt, &w.1, &[]);
+        if let Some((net, st)) = a.helper.as_mut() {
+            helper::tick(net, &net.w, &mut a.agent, &w.0, st, dt);
+        }
+        a.agent.step_follow(&a.build, &w.0, dt, &w.1, &a.others);
     } else {
-        a.agent.step(&a.build, &w.0, dt, &w.1, &[]);
+        if let Some((net, st)) = a.helper.as_mut() {
+            helper::tick(net, &net.w, &mut a.agent, &w.0, st, dt);
+        }
+        a.agent.step(&a.build, &w.0, dt, &w.1, &a.others);
     }
     a.set.fill(false);
+    0
+}
+
+/// Sets the capsules the agent is pushed by from its next step on (one-way: they don't move): `count` x 11 floats,
+/// end a xyz, end b xyz, radius, velocity xyz, and 1 when it is a body (another ragdoll's part: the overlap is shared,
+/// half pushed out each side) or 0 (solid: a character controller). Same frame as the agent's parts. count 0 clears.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_set_others(a: *mut NmAgent, caps: *const f32, count: i32) -> i32 {
+    let a = agent!(a);
+    if count < 0 || (count > 0 && caps.is_null()) {
+        return fail(NM_E_ARG, "nm_agent_set_others: bad array");
+    }
+    let f = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(caps, count as usize * 11) } };
+    a.others = f.chunks(11).map(|c| (Vec3::new(c[0], c[1], c[2]), Vec3::new(c[3], c[4], c[5]), c[6].max(0.0), Vec3::new(c[7], c[8], c[9]), c[10] != 0.0)).collect();
+    0
+}
+
+/// The agent's parts as capsules, in nm_agent_set_others's layout (11 floats each, the body flag 1), for another agent
+/// to be pushed by. Writes at most `max`; returns the part count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_get_capsules(a: *const NmAgent, out: *mut f32, max: i32) -> i32 {
+    let a = agent_ref!(a);
+    let d = &a.agent.doll;
+    let n = a.build.parts.len();
+    if !out.is_null() && max > 0 {
+        let o = unsafe { std::slice::from_raw_parts_mut(out, max.min(n as i32) as usize * 11) };
+        for ((k, (t, p)), c) in d.capsules().zip(&a.build.parts).enumerate().zip(o.chunks_mut(11)) {
+            let ax = t.rotation * Vec3::Y * p.half;
+            let (e0, e1, v) = (t.translation - ax, t.translation + ax, d.motion(k).0);
+            c.copy_from_slice(&[e0.x, e0.y, e0.z, e1.x, e1.y, e1.z, p.radius, v.x, v.y, v.z, 1.0]);
+        }
+    }
+    n as i32
+}
+
+pub struct NmGroup(delirium::ragdoll::Group);
+
+/// A group: agents stepped together in one world (nm_group_step), so their bodies push each other, held contacts and
+/// all. Keeps the contacts between its agents from step to step.
+#[unsafe(no_mangle)]
+pub extern "C" fn nm_group_create() -> *mut NmGroup {
+    Box::into_raw(Box::new(NmGroup(Default::default())))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_group_destroy(g: *mut NmGroup) {
+    if !g.is_null() {
+        drop(unsafe { Box::from_raw(g) });
+    }
+}
+
+/// Steps `count` LEAD agents together by `dt` in world `w`: one solve for all of them, where their bodies touch. Each
+/// also meets its own capsules (nm_agent_set_others). Their parts must all be in one frame (made and placed relative to
+/// the same origin). An agent in another mode fails the call (step it with nm_agent_step). Instead of nm_agent_step
+/// for these agents, once each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_group_step(g: *mut NmGroup, w: *const NmWorld, agents: *mut *mut NmAgent, count: i32, dt: f32) -> i32 {
+    let Some(g) = (unsafe { g.as_mut() }) else { return fail(NM_E_ARG, "null group") };
+    let Some(w) = (unsafe { w.as_ref() }) else { return fail(NM_E_ARG, "null world") };
+    if !(dt > 0.0 && dt <= 0.25) {
+        return fail(NM_E_ARG, "dt out of (0, 0.25]");
+    }
+    if count < 0 || (count > 0 && agents.is_null()) {
+        return fail(NM_E_ARG, "nm_group_step: bad array");
+    }
+    let ptrs = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(agents, count as usize) } };
+    let mut all: Vec<&mut NmAgent> = Vec::with_capacity(ptrs.len());
+    for (i, &p) in ptrs.iter().enumerate() {
+        if p.is_null() || ptrs[..i].contains(&p) {
+            return fail(NM_E_ARG, "nm_group_step: null or repeated agent");
+        }
+        let a = unsafe { &mut *p };
+        if a.mode != NM_MODE_LEAD {
+            return fail(NM_E_STATE, "nm_group_step: LEAD agents only");
+        }
+        all.push(a);
+    }
+    for a in all.iter_mut() {
+        if let Some((net, st)) = a.helper.as_mut() {
+            helper::tick(net, &net.w, &mut a.agent, &w.0, st, dt);
+        }
+    }
+    let mut members: Vec<(&mut Agent, usize, &Build, &[Obstacle], &[delirium::ragdoll::Capsule])> =
+        all.iter_mut().map(|a| { let a = &mut **a; (&mut a.agent, a.id, &a.build, &w.1[..], &a.others[..]) }).collect();
+    Agent::step_group(&mut members, &w.0, dt, &mut g.0);
+    drop(members);
+    all.iter_mut().for_each(|a| a.set.fill(false));
     0
 }
 
@@ -1108,8 +1229,8 @@ pub unsafe extern "C" fn nm_agent_task_shot(a: *mut NmAgent, w: *const NmWorld, 
     let set = unsafe { text(set) }.unwrap_or("*");
     let hit = nm::Hit { health, ..nm::Hit::ragdoll(&a.agent) };
     let dir = unsafe { v3(dir) }.normalize_or_zero();
-    with_tp(|tp| nm::task_shot(&mut a.agent, &a.build, &w.0, tp, &mut RAND.lock().unwrap_or_else(|e| e.into_inner()), set, hit, part as usize,
-                               unsafe { v3(at) }, dir * SHOT_FORCE, -dir, false));
+    let at = unsafe { v3(at) };
+    with_rand(&mut a.rand, |r| with_tp(|tp| nm::task_shot(&mut a.agent, &a.build, &w.0, tp, r, set, hit, part as usize, at, dir * SHOT_FORCE, -dir, false)));
     0
 }
 
@@ -1139,6 +1260,74 @@ pub unsafe extern "C" fn nm_agent_task_flinch(a: *mut NmAgent, w: *const NmWorld
         return fail(NM_E_ARG, "null vector");
     }
     let set = unsafe { text(set) }.unwrap_or("*");
-    with_tp(|tp| nm::task_flinch(&mut a.agent, &a.build, &w.0, tp, &mut RAND.lock().unwrap_or_else(|e| e.into_inner()), set, unsafe { v3(from) }));
+    let from = unsafe { v3(from) };
+    with_rand(&mut a.rand, |r| with_tp(|tp| nm::task_flinch(&mut a.agent, &a.build, &w.0, tp, r, set, from)));
     0
+}
+
+/// A trained balance helper (helper.rs), shared by any number of agents.
+pub struct NmHelper(std::sync::Arc<helper::Net>);
+
+/// Loads a balance helper network (.helper file from the trainer); null on failure (nm_last_error says why).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_helper_load(path: *const c_char) -> *mut NmHelper {
+    let Some(p) = (unsafe { text(path) }) else {
+        fail(NM_E_ARG, "nm_helper_load: no path");
+        return std::ptr::null_mut();
+    };
+    match helper::Net::load(p) {
+        Some(n) => Box::into_raw(Box::new(NmHelper(std::sync::Arc::new(n)))),
+        None => {
+            fail(NM_E_PARSE, format!("{p}: not a balance helper network"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Agents keep their own reference: destroying the helper does not stop agents already using it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_helper_destroy(h: *mut NmHelper) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// Lets the helper steer this agent's balancer while she balances (null: off, the balancer as built).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_set_helper(a: *mut NmAgent, h: *const NmHelper) -> i32 {
+    let a = agent!(a);
+    attach_helper(a, unsafe { h.as_ref() }.map(|h| h.0.clone()));
+    0
+}
+
+/// Tells the helper what just hit her: 1 push / melee / stagger, 2 shot, 3 burn, 4 shock, 5 chill (0 none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nm_agent_helper_hit(a: *mut NmAgent, kind: i32) -> i32 {
+    let a = agent!(a);
+    if !(0..helper::HITS as i32).contains(&kind) {
+        return fail(NM_E_ARG, "hit kind 0-5");
+    }
+    if let Some((_, st)) = a.helper.as_mut() {
+        st.hit(kind as usize);
+    }
+    0
+}
+
+/// Rust hosts (the trainer): a network of their own, or None.
+pub fn attach_helper(a: &mut NmAgent, net: Option<std::sync::Arc<helper::Net>>) {
+    a.helper = net.map(|n| (n, helper::State::default()));
+    if a.helper.is_none() {
+        a.agent.assist = None;
+    }
+}
+
+/// Rust hosts: the agent's balancer state for the trainer's measurements.
+pub fn agent_core(a: &NmAgent) -> &Agent {
+    &a.agent
+}
+
+/// Rust hosts: what the helper would see now (its own state if attached, else a fresh one).
+pub fn helper_observe(a: &NmAgent, w: &NmWorld) -> [f32; helper::OBS] {
+    let st = a.helper.as_ref().map_or_else(helper::State::default, |h| h.1);
+    helper::observe(&a.agent, &w.0, &st)
 }

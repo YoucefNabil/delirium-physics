@@ -18,6 +18,7 @@ namespace Delirium
         public const int NM_E_FOLLOW = -8;
         public const int NM_MODE_LEAD = 0;
         public const int NM_MODE_FOLLOW = 1;
+        public const int NM_MODE_BODY = 2;
         public const int NM_KIND_FLOAT = 0;
         public const int NM_KIND_INT = 1;
         public const int NM_KIND_BOOL = 2;
@@ -33,6 +34,9 @@ namespace Delirium
         public static extern int nm_init([MarshalAs(UnmanagedType.LPUTF8Str)] string xrt_path);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_load_task_params([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        /// <summary>Sets one task parameter (task, set or "*", name) on top of any loaded file, e.g. ("NMShot_Standing", "*", "shotMaxSteps", 10).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_set_task_param([MarshalAs(UnmanagedType.LPUTF8Str)] string task, [MarshalAs(UnmanagedType.LPUTF8Str)] string set, [MarshalAs(UnmanagedType.LPUTF8Str)] string name, float value);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_part_name(int i, byte[] buf, int len);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -75,17 +79,37 @@ namespace Delirium
         public static extern int nm_build_set_mass(IntPtr b, int i, float kg);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr nm_build_fit(IntPtr build, float[] joints);
-        /// <summary>Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is turned on until its joint -&gt; child joint line runs along the skeleton's and stretched to it; shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_free) or null.</summary>
+        /// <summary>Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is stretched to the skeleton's joint distance; with bit (1 &lt;&lt; part) set in `align` it is also turned on until its joint -&gt; child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_destroy) or null.</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr nm_build_remap(IntPtr build, float[] joints, float[] rots);
+        public static extern IntPtr nm_build_remap(IntPtr build, float[] joints, float[] rots, uint align);
+        /// <summary>Moves part i's joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are centred on a stance the body wasn't built for (Build::turn_limit). Agents made from the build afterwards use it.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_build_turn_limit(IntPtr b, int i, float[] rot);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_build_part_frame(IntPtr b, int i, float[] pos, float[] rot);
+        /// <summary>Gives the agent its own random numbers for hit tasks (shots, flinches), so its reactions repeat whatever other agents do on other threads. seed 0 goes back to the shared ones.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_seed_tasks(IntPtr a, uint seed);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr nm_agent_create(IntPtr b, float[] pos, float yaw, float seed);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void nm_agent_destroy(IntPtr a);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_step(IntPtr a, IntPtr w, float dt);
+        /// <summary>Sets the capsules the agent is pushed by from its next step on (one-way: they don't move): `count` x 11 floats, end a xyz, end b xyz, radius, velocity xyz, and 1 when it is a body (another ragdoll's part: the overlap is shared, half pushed out each side) or 0 (solid: a character controller). Same frame as the agent's parts. count 0 clears.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_set_others(IntPtr a, float[] caps, int count);
+        /// <summary>The agent's parts as capsules, in nm_agent_set_others's layout (11 floats each, the body flag 1), for another agent to be pushed by. Writes at most `max`; returns the part count.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_capsules(IntPtr a, float[] @out, int max);
+        /// <summary>A group: agents stepped together in one world (nm_group_step), so their bodies push each other, held contacts and all. Keeps the contacts between its agents from step to step.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr nm_group_create();
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void nm_group_destroy(IntPtr g);
+        /// <summary>Steps `count` LEAD agents together by `dt` in world `w`: one solve for all of them, where their bodies touch. Each also meets its own capsules (nm_agent_set_others). Their parts must all be in one frame (made and placed relative to the same origin). An agent in another mode fails the call (step it with nm_agent_step). Instead of nm_agent_step for these agents, once each.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_group_step(IntPtr g, IntPtr w, IntPtr[] agents, int count, float dt);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_set_mode(IntPtr a, int mode);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -98,6 +122,9 @@ namespace Delirium
         public static extern int nm_agent_get_part_transforms(IntPtr a, float[] @out, int parts);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_get_part_velocity(IntPtr a, int i, float[] vel, float[] angvel);
+        /// <summary>Part `i`'s world inverse inertia (9 floats, row-major) and inverse mass: what a host needs to turn the joint accelerations into its own bodies' spins the way the plugin does, when the host is a test body (NM_MODE_BODY).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_part_inv_inertia(IntPtr a, int i, float[] inv, float[] inv_mass);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_set_part_state(IntPtr a, int i, float[] pos, float[] rot, float[] vel, float[] angvel);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -111,6 +138,12 @@ namespace Delirium
         public static extern int nm_agent_get_part_drive(IntPtr a, int i, float[] force, float[] torque);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_get_part_drives(IntPtr a, float[] @out, int parts);
+        /// <summary>Every part's joint acceleration from its muscles (3 floats each, world, rad/s^2): how fast the muscles turn the part against its parent through the whole body. A FOLLOW host whose own bodies have other masses applies this as a change of the joint's relative spin (times its step) rather than the torques. The root's is zero.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_joint_accels(IntPtr a, float[] @out, int parts);
+        /// <summary>Every part's torque from behaviours acting on the part itself (3 floats each, world, N m): a shot's spin, electrocute's jolts. Not the muscles' (nm_agent_get_joint_accels): a FOLLOW host turns its own body by this on top of them.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_get_part_ext_torques(IntPtr a, float[] @out, int parts);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_get_part_contact(IntPtr a, int i);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -173,6 +206,9 @@ namespace Delirium
         public static extern int nm_agent_get_param_string(IntPtr a, [MarshalAs(UnmanagedType.LPUTF8Str)] string message, [MarshalAs(UnmanagedType.LPUTF8Str)] string param, byte[] buf, int len);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_is_balancing(IntPtr a);
+        /// <summary>The balancer's stepping foot: 0 none, 1 left, 2 right; -1 when not balancing.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_balance_stepping(IntPtr a);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_has_fallen(IntPtr a);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
@@ -199,6 +235,18 @@ namespace Delirium
         public static extern int nm_agent_task_catch_fall(IntPtr a, [MarshalAs(UnmanagedType.LPUTF8Str)] string set);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_agent_task_flinch(IntPtr a, IntPtr w, [MarshalAs(UnmanagedType.LPUTF8Str)] string set, float[] from);
+        /// <summary>Loads a balance helper network (.helper file from the trainer); null on failure (nm_last_error says why).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr nm_helper_load([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        /// <summary>Agents keep their own reference: destroying the helper does not stop agents already using it.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void nm_helper_destroy(IntPtr h);
+        /// <summary>Lets the helper steer this agent's balancer while she balances (null: off, the balancer as built).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_set_helper(IntPtr a, IntPtr h);
+        /// <summary>Tells the helper what just hit her: 1 push / melee / stagger, 2 shot, 3 burn, 4 shock, 5 chill (0 none).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int nm_agent_helper_hit(IntPtr a, int kind);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern int nm_init_character([MarshalAs(UnmanagedType.LPUTF8Str)] string json);
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

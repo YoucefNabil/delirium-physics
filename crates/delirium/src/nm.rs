@@ -226,7 +226,25 @@ pub type FallOverWall = crate::nmfow::FallOverWallParams;
 fn dbm_config(c: ConfigureBalance, params: &BodyBalance, lean_bias: f32, hip_yaw: (f32, f32), legs: (f32, f32)) -> crate::nmdbm::Config {
     crate::nmdbm::Config { step_height: c.step_height, leg_stiffness: c.leg_stiffness, abort: c.balance_abort_threshold,
                            step_clamp: c.step_clamp_scale, max_steps: params.max_steps as i32, taper: c.taper_knee_strength,
-                           lean_bias, hip_yaw, legs }
+                           lean_bias, hip_yaw, legs, assist: None }
+}
+
+/// A trained helper's adjustments to the balancer, held until changed (delirium-sdk helper.rs). Multipliers on the
+/// settings in force each tick (whatever the behaviours sent), so nothing stored drifts; the spine's is the upper
+/// body's ("ub") stiffness that bodyBalance holds. None: the balancer as built.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BalanceAssist {
+    pub leg_stiffness: f32,
+    pub step_height: f32,
+    pub step_clamp: f32,
+    pub spine_stiffness: f32,
+    pub dbm: crate::nmdbm::Assist,
+}
+
+impl Default for BalanceAssist {
+    fn default() -> BalanceAssist {
+        BalanceAssist { leg_stiffness: 1.0, step_height: 1.0, step_clamp: 1.0, spine_stiffness: 1.0, dbm: Default::default() }
+    }
 }
 
 impl BodyBalance {
@@ -342,6 +360,7 @@ pub struct Agent {
     pub msgs: crate::msg::State,
     pub(crate) ch: Option<crate::nmrs::Character>,
     pub lean_bias: f32,
+    pub assist: Option<BalanceAssist>,
     pub hip_yaw: (f32, f32),
     pub legs: (f32, f32),
     pub strength: f32,
@@ -391,7 +410,7 @@ impl Agent {
         let mut a = Agent { doll, msgs: Default::default(), push: vec![], contact_wake: false, roles, zero, pelvis_up, facing, random: Random::new((seed * 1000.0) as u32 + 1), time: 0.0,
                 stiffness: (10.0, 1.0), relax: None, config: ConfigureBalance::default(), feedback: vec![], balance: None, lean: None,
                 shot: None, nm_shot: None, nm_hit: None, nm_hit_next: vec![], nm_relax: None, nm_head: Default::default(), nm_cf: None, nm_cf_msg: None, nm_twist: Default::default(), hands_back: false, nm_fl: Default::default(), nm_fl_msg: None, nm_bw: None, nm_bw_msg: None, extras: Default::default(), nm_aw: Default::default(), nm_aw_msg: None, nm_pd: Default::default(), nm_pd_msg: None, nm_bf: Default::default(), nm_bf_msg: None, incoming: vec![], incoming_prev: vec![], incoming_state: 0, incoming_v_ref: Vec3::ZERO, nm_ru: Default::default(), nm_ru_msg: None, nm_rds: Default::default(), nm_rds_msg: None, rds_on: false, bb_on: false, nm_pa: Default::default(), nm_pa_msg: None, nm_gr: Default::default(), obstacles: vec![], nm_gr_msg: None, nm_br: Default::default(), nm_br_msg: None, nm_br_started: None, nm_hf: Default::default(), nm_hf_msg: None, nm_fow: Default::default(), nm_fow_msg: None, catch_fall: None, flinch: None, writhe: None, windmill: None, pedal: None, roll_up: None,
-                brace: None, head_look: vec![], shot_look: false, eff_override: vec![], nm_dt: None, held: None, held_eff: vec![], nm_shot_started: None, fallen: false, task_look: None, lean_bias: -0.22, hip_yaw: crate::nmdbm::CHAR_YAW, legs: (crate::nmdbm::CHAR_LEGS.0 * build.parts[0].grown, crate::nmdbm::CHAR_LEGS.1 * build.parts[0].grown), strength: 1.0, most: build.parts.first().filter(|p| p.heft != 1.0 || p.grown != 1.0).map_or(1.0, |p| p.heft * p.size.powi(3) * p.grown),
+                brace: None, head_look: vec![], shot_look: false, eff_override: vec![], nm_dt: None, held: None, held_eff: vec![], nm_shot_started: None, fallen: false, task_look: None, lean_bias: -0.22, assist: None, hip_yaw: crate::nmdbm::CHAR_YAW, legs: (crate::nmdbm::CHAR_LEGS.0 * build.parts[0].grown, crate::nmdbm::CHAR_LEGS.1 * build.parts[0].grown), strength: 1.0, most: build.parts.first().filter(|p| p.heft != 1.0 || p.grown != 1.0).map_or(1.0, |p| p.heft * p.size.powi(3) * p.grown),
                 ch: crate::nmrs::ASSET[build.nm].get().and_then(|a| crate::nmrs::joints(build, a)).map(|j| {
                     let mut c = crate::nmrs::Character::new(j, &frames);
                     c.mode = if build.nm == crate::nmrs::MARGE { 2 } else { 1 };
@@ -1304,7 +1323,11 @@ impl Agent {
         }
         if let (Some(b), Some(ch), true) = (self.balance.as_mut(), self.ch.as_mut(), nm_tick) {
             if let Some(dbm) = b.dbm.as_mut() {
-                let c = dbm_config(self.config, &b.params, self.lean_bias, self.hip_yaw, self.legs);
+                let mut c = dbm_config(self.config, &b.params, self.lean_bias, self.hip_yaw, self.legs);
+                if let Some(x) = self.assist {
+                    (c.leg_stiffness, c.step_height, c.step_clamp) = (c.leg_stiffness * x.leg_stiffness, c.step_height * x.step_height, c.step_clamp * x.step_clamp);
+                    c.assist = Some(x.dbm);
+                }
                 dbm.lean = match self.lean {
                     Some((dir, amount, _, as_force)) => crate::nmdbm::Lean { mode: crate::nmdbm::LeanMode::Dir(dir), amount, as_force },
                     None => Default::default(),
@@ -1340,7 +1363,12 @@ impl Agent {
                 if let Some(bb) = b.bb.as_mut() {
                     let snap = ch.clone();
                     let body = crate::nmdbm::Body { ch: &snap, build, doll: &self.doll, frames: &frames };
+                    let spine = bb.p.head_look_always_timeout;
+                    if let Some(x) = self.assist {
+                        bb.p.head_look_always_timeout *= x.spine_stiffness;
+                    }
                     let out = bb.tick(ch, &body, obstacles, dbm.f.stepping, failed, self.catch_fall.is_some(), dt);
+                    bb.p.head_look_always_timeout = spine;
                     (dbm.pv.fixed_vel, dbm.pv.vel) = (out.turn.is_some(), out.turn.unwrap_or(Vec3::ZERO));
                     if let Some(k) = out.step_clamp {
                         self.config.step_clamp_scale = k;

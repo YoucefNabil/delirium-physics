@@ -184,6 +184,27 @@ pub struct Params {
     pub taper: bool,
     pub low_abort: bool,
     pub contact: [bool; 2],
+    pub assist: Option<Assist>,
+}
+
+/// A trained helper's adjustments for one tick (delirium-sdk helper.rs); None leaves the balancer as built. The env
+/// knobs (NM_UPRIGHT, NM_FAST, NM_FAST_LAND) win over these when set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Assist {
+    /// added to the desired pelvis pitch (> 0 pitches it back)
+    pub pitch: f32,
+    /// pitch the desired pelvis against its own tilt along its facing (NM_UPRIGHT's k, not gated by speed)
+    pub upright: f32,
+    /// 0-1: the swing foot lifts less and reaches faster (NM_FAST's amount, not gated by speed)
+    pub fast: f32,
+    /// the swing foot lands once this much of its way is left (0.5 as built)
+    pub land: f32,
+}
+
+impl Default for Assist {
+    fn default() -> Assist {
+        Assist { pitch: 0.0, upright: 0.0, fast: 0.0, land: 0.5 }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -534,7 +555,7 @@ pub fn foot_placement(p: &Params, s: &Snap, f: &mut Feet) {
     f.centre = up.mul_add(Vec3::splat(sdot(mid, up, b"yzx") - sdot(f.centre, up, b"yzx")), f.centre);
     f.flags = (f.flags & 0x3F) | if two { 0x80 } else { 0x40 };
     let other = if two { s.flags & 0x80 != 0 } else { s.flags & 0x20 != 0 };
-    let land_at = knobs().fast_land.map_or(0.5, |x| 0.5 + (x - 0.5) * urgency(s.hvel));
+    let land_at = knobs().fast_land.map_or(p.assist.map_or(0.5, |a| a.land), |x| 0.5 + (x - 0.5) * urgency(s.hvel));
     let landed = contact && speed < 0.0 && (left_frac < land_at || (f.flags & 8 != 0 && f.flags & 16 != 0));
     if landed || (contact && !other) {
         f.flags |= if two { 0x40 } else { 0x80 };
@@ -620,6 +641,10 @@ pub fn pelvis_control(p: &Params, s: &Snap, pv: &mut Pelvis) {
         let back = asin(-sdot(horizontal(m.a, up), fwd, b"zyx"));
         let u = urgency(s.hvel);
         pv.acc = (pv.acc - u * k * back).clamp(-0.6, 0.6);
+    } else if let Some(a) = p.assist.filter(|a| a.pitch != 0.0 || a.upright != 0.0) {
+        let fwd = vnorm(up.vx(vnorm(m.c.vx(up))));
+        let back = asin(-sdot(horizontal(m.a, up), fwd, b"zyx"));
+        pv.acc = (pv.acc + a.pitch - a.upright * back).clamp(-0.6, 0.6);
     }
     let g = -sdot(p.normal[1], s.legs[1].foot.m.c, b"yzx") + -sdot(p.normal[0], s.legs[0].foot.m.c, b"yzx");
     if g > 0.05 {
@@ -841,8 +866,7 @@ pub fn balance_solve(p: &Params, f: &Feet, pv: &Pelvis, s: &mut Snap) {
         if !planted {
             let ahead = target[i] - (lfoot_v - p.gvel[0]).mul_add(Vec3::splat(0.05), leg.foot.m.d);
             (c.lead, c.reach, c.lift) = (p.p168, 5.0, sdot(up, ahead, b"yxz").fma(4.0, 0.1).clamp(0.15, 0.6));
-            if let Some(k) = knobs().fast {
-                let u = k * urgency(s.hvel);
+            if let Some(u) = knobs().fast.map(|k| k * urgency(s.hvel)).or(p.assist.map(|a| a.fast)) {
                 (c.reach, c.lift) = (c.reach * (1.0 + u), (c.lift * (1.0 - 0.7 * u)).max(0.05));
             }
         }
@@ -1099,6 +1123,7 @@ pub struct Config {
     pub lean_bias: f32,
     pub hip_yaw: (f32, f32),
     pub legs: (f32, f32),
+    pub assist: Option<Assist>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1305,6 +1330,7 @@ impl Dbm {
             self.p.lead = l;
         }
         self.p.step_height = c.step_height;
+        self.p.assist = c.assist;
         self.tilt(b);
         let mut s = b.snap(self.p.up);
         self.last = (s.m.b, s.angvel);

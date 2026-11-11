@@ -15,6 +15,8 @@ extern "C" {
 typedef struct NmWorld NmWorld;
 typedef struct NmBuild NmBuild;
 typedef struct NmAgent NmAgent;
+typedef struct NmGroup NmGroup;
+typedef struct NmHelper NmHelper;
 
 #define NM_E_ARG (-1)
 #define NM_E_IO (-2)
@@ -26,6 +28,7 @@ typedef struct NmAgent NmAgent;
 #define NM_E_FOLLOW (-8)
 #define NM_MODE_LEAD (0)
 #define NM_MODE_FOLLOW (1)
+#define NM_MODE_BODY (2)
 #define NM_KIND_FLOAT (0)
 #define NM_KIND_INT (1)
 #define NM_KIND_BOOL (2)
@@ -37,6 +40,7 @@ NM_API int32_t nm_last_error(char* buf, int32_t len);
 NM_API int32_t nm_init_memory(const uint8_t* xrt, int32_t len);
 NM_API int32_t nm_init(const char* xrt_path);
 NM_API int32_t nm_load_task_params(const char* path);
+/* Sets one task parameter (task, set or "*", name) on top of any loaded file, e.g. ("NMShot_Standing", "*", "shotMaxSteps", 10). */
 NM_API int32_t nm_set_task_param(const char* task, const char* set, const char* name, float value);
 NM_API int32_t nm_part_name(int32_t i, char* buf, int32_t len);
 NM_API NmWorld* nm_world_create(void);
@@ -61,20 +65,33 @@ NM_API int32_t nm_build_part_info(const NmBuild* b, int32_t i, float* mass, floa
 /* Sets part `i`'s mass to `kg` (inertia follows), keeping its shape: for a fitted build whose cubed length scale overweights some parts. Agents made from the build afterwards use it. */
 NM_API int32_t nm_build_set_mass(NmBuild* b, int32_t i, float kg);
 NM_API NmBuild* nm_build_fit(const NmBuild* build, const float* joints);
-/* Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is stretched to the skeleton's joint distance; with bit (1 << part) set in `align` it is also turned on until its joint -> child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_free) or null. */
+/* Rebuilds a 21-part build on another skeleton's bind pose: `joints` (21 x xyz, world) is where each part's joint goes (the root's: its origin), `rots` (21 x quaternion xyzw) how each part is turned. A part with one child is stretched to the skeleton's joint distance; with bit (1 << part) set in `align` it is also turned on until its joint -> child joint line runs along the skeleton's. Shapes, joint limits and muscles stay in each part's own frame. Returns a new build (free with nm_build_destroy) or null. */
 NM_API NmBuild* nm_build_remap(const NmBuild* build, const float* joints, const float* rots, uint32_t align);
-NM_API int32_t nm_build_part_frame(const NmBuild* b, int32_t i, float* pos, float* rot);
-/* Moves part `i`'s joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are centred on a stance the body was not built for (a hunched creature on a person's body). Its rest moves with them. Agents made from the build afterwards use it. Fails for the root. */
+/* Moves part i's joint limits on by `rot` (quaternion xyzw: a turn of the part in its parent's frame), so they are centred on a stance the body wasn't built for (Build::turn_limit). Agents made from the build afterwards use it. */
 NM_API int32_t nm_build_turn_limit(NmBuild* b, int32_t i, const float* rot);
+NM_API int32_t nm_build_part_frame(const NmBuild* b, int32_t i, float* pos, float* rot);
+/* Gives the agent its own random numbers for hit tasks (shots, flinches), so its reactions repeat whatever other agents do on other threads. seed 0 goes back to the shared ones. */
+NM_API int32_t nm_agent_seed_tasks(NmAgent* a, uint32_t seed);
 NM_API NmAgent* nm_agent_create(const NmBuild* b, const float* pos, float yaw, float seed);
 NM_API void nm_agent_destroy(NmAgent* a);
 NM_API int32_t nm_agent_step(NmAgent* a, const NmWorld* w, float dt);
+/* Sets the capsules the agent is pushed by from its next step on (one-way: they don't move): `count` x 11 floats, end a xyz, end b xyz, radius, velocity xyz, and 1 when it is a body (another ragdoll's part: the overlap is shared, half pushed out each side) or 0 (solid: a character controller). Same frame as the agent's parts. count 0 clears. */
+NM_API int32_t nm_agent_set_others(NmAgent* a, const float* caps, int32_t count);
+/* The agent's parts as capsules, in nm_agent_set_others's layout (11 floats each, the body flag 1), for another agent to be pushed by. Writes at most `max`; returns the part count. */
+NM_API int32_t nm_agent_get_capsules(const NmAgent* a, float* out, int32_t max);
+/* A group: agents stepped together in one world (nm_group_step), so their bodies push each other, held contacts and all. Keeps the contacts between its agents from step to step. */
+NM_API NmGroup* nm_group_create(void);
+NM_API void nm_group_destroy(NmGroup* g);
+/* Steps `count` LEAD agents together by `dt` in world `w`: one solve for all of them, where their bodies touch. Each also meets its own capsules (nm_agent_set_others). Their parts must all be in one frame (made and placed relative to the same origin). An agent in another mode fails the call (step it with nm_agent_step). Instead of nm_agent_step for these agents, once each. */
+NM_API int32_t nm_group_step(NmGroup* g, const NmWorld* w, NmAgent** agents, int32_t count, float dt);
 NM_API int32_t nm_agent_set_mode(NmAgent* a, int32_t mode);
 NM_API int32_t nm_agent_get_mode(const NmAgent* a);
 NM_API int32_t nm_agent_part_count(const NmAgent* a);
 NM_API int32_t nm_agent_get_part_transform(const NmAgent* a, int32_t i, float* pos, float* rot);
 NM_API int32_t nm_agent_get_part_transforms(const NmAgent* a, float* out, int32_t parts);
 NM_API int32_t nm_agent_get_part_velocity(const NmAgent* a, int32_t i, float* vel, float* angvel);
+/* Part `i`'s world inverse inertia (9 floats, row-major) and inverse mass: what a host needs to turn the joint accelerations into its own bodies' spins the way the plugin does, when the host is a test body (NM_MODE_BODY). */
+NM_API int32_t nm_agent_get_part_inv_inertia(const NmAgent* a, int32_t i, float* inv, float* inv_mass);
 NM_API int32_t nm_agent_set_part_state(NmAgent* a, int32_t i, const float* pos, const float* rot, const float* vel, const float* angvel);
 NM_API int32_t nm_agent_set_part_states(NmAgent* a, const float* states, int32_t parts);
 NM_API int32_t nm_agent_set_incoming_transforms(NmAgent* a, const float* transforms, int32_t parts);
@@ -82,7 +99,9 @@ NM_API int32_t nm_agent_set_incoming_transforms(NmAgent* a, const float* transfo
 NM_API int32_t nm_agent_set_zero_pose(NmAgent* a, const float* transforms, int32_t parts);
 NM_API int32_t nm_agent_get_part_drive(const NmAgent* a, int32_t i, float* force, float* torque);
 NM_API int32_t nm_agent_get_part_drives(const NmAgent* a, float* out, int32_t parts);
+/* Every part's joint acceleration from its muscles (3 floats each, world, rad/s^2): how fast the muscles turn the part against its parent through the whole body. A FOLLOW host whose own bodies have other masses applies this as a change of the joint's relative spin (times its step) rather than the torques. The root's is zero. */
 NM_API int32_t nm_agent_get_joint_accels(const NmAgent* a, float* out, int32_t parts);
+/* Every part's torque from behaviours acting on the part itself (3 floats each, world, N m): a shot's spin, electrocute's jolts. Not the muscles' (nm_agent_get_joint_accels): a FOLLOW host turns its own body by this on top of them. */
 NM_API int32_t nm_agent_get_part_ext_torques(const NmAgent* a, float* out, int32_t parts);
 NM_API int32_t nm_agent_get_part_contact(const NmAgent* a, int32_t i);
 NM_API int32_t nm_agent_get_com(const NmAgent* a, float* pos, float* vel);
@@ -115,6 +134,8 @@ NM_API int32_t nm_msg_cancel(NmAgent* a);
 NM_API int32_t nm_agent_get_param(const NmAgent* a, const char* message, const char* param, float* out);
 NM_API int32_t nm_agent_get_param_string(const NmAgent* a, const char* message, const char* param, char* buf, int32_t len);
 NM_API int32_t nm_agent_is_balancing(const NmAgent* a);
+/* The balancer's stepping foot: 0 none, 1 left, 2 right; -1 when not balancing. */
+NM_API int32_t nm_agent_balance_stepping(const NmAgent* a);
 NM_API int32_t nm_agent_has_fallen(const NmAgent* a);
 NM_API int32_t nm_agent_is_settled(const NmAgent* a);
 NM_API int32_t nm_agent_is_relaxing(const NmAgent* a);
@@ -128,6 +149,14 @@ NM_API int32_t nm_agent_task_shot(NmAgent* a, const NmWorld* w, const char* set,
 NM_API int32_t nm_agent_task_balance(NmAgent* a, const NmWorld* w, const char* set, const float* look);
 NM_API int32_t nm_agent_task_catch_fall(NmAgent* a, const char* set);
 NM_API int32_t nm_agent_task_flinch(NmAgent* a, const NmWorld* w, const char* set, const float* from);
+/* Loads a balance helper network (.helper file from the trainer); null on failure (nm_last_error says why). */
+NM_API NmHelper* nm_helper_load(const char* path);
+/* Agents keep their own reference: destroying the helper does not stop agents already using it. */
+NM_API void nm_helper_destroy(NmHelper* h);
+/* Lets the helper steer this agent's balancer while she balances (null: off, the balancer as built). */
+NM_API int32_t nm_agent_set_helper(NmAgent* a, const NmHelper* h);
+/* Tells the helper what just hit her: 1 push / melee / stagger, 2 shot, 3 burn, 4 shock, 5 chill (0 none). */
+NM_API int32_t nm_agent_helper_hit(NmAgent* a, int32_t kind);
 NM_API int32_t nm_init_character(const char* json);
 NM_API int32_t nm_init_character_file(const char* path);
 NM_API NmBuild* nm_build_from_character(const char* json);
